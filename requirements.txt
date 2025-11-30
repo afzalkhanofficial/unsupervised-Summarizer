@@ -1,9 +1,21 @@
-flask>=2.0.0
-gunicorn>=20.0.4
+Flask>=2.0
+gunicorn>=20.1
+
+# Sentence-BERT and dependencies
 sentence-transformers>=2.2.2
-torch>=1.12.0
-scikit-learn>=1.0.2
-numpy>=1.21.0
-networkx>=2.6.3
-PyMuPDF>=1.22.0
-nltk>=3.6.7
+torch>=1.13.1
+
+# Utilities for embeddings, similarity, graphs
+numpy>=1.23
+scikit-learn>=1.1
+networkx>=2.8
+
+# PDF extraction
+pdfplumber>=0.7.6
+pdfminer.six>=20221105
+
+# Sentence tokenizer
+nltk>=3.7
+
+# Optional (helpful for potential OCR fallback later; not required)
+# pytesseract>=0.3.10
