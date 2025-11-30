@@ -1,319 +1,326 @@
-import os
 import io
+import re
 import math
-import fitz  # PyMuPDF
+import os
+from typing import List, Tuple
+
+from flask import Flask, request, render_template_string, abort, send_file
 import numpy as np
-from flask import Flask, request, redirect, url_for, render_template_string, send_file, abort
-from werkzeug.utils import secure_filename
+import networkx as nx
+
+# sentence-transformers and its dependencies
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
-import umap
-import hdbscan
-import networkx as nx
-import nltk
-import tempfile
-import traceback
 
-# Ensure punkt is available (downloads if needed)
+# PDF extraction
+import fitz  # PyMuPDF
+
+# For robust sentence tokenization with fallback
 try:
-    nltk.data.find("tokenizers/punkt")
+    import nltk
+
+    _nltk_available = True
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        # try to download punkt quietly; if this fails we'll fall back to regex
+        try:
+            nltk.download('punkt', quiet=True)
+        except Exception:
+            pass
 except Exception:
-    nltk.download("punkt", quiet=True)
-
-from nltk.tokenize import sent_tokenize
-
-# -------------------------
-# Configuration
-# -------------------------
-ALLOWED_EXTENSIONS = {"pdf", "txt"}
-MAX_FILE_MB = 25
-DEFAULT_SUMMARY_SENTENCES = 5
-MODEL_NAME = os.environ.get("SBERT_MODEL", "all-MiniLM-L6-v2")  # lightweight, good tradeoff
-
-# UMAP / HDBSCAN hyperparams tuned for short-to-medium doc summarization
-UMAP_N_COMPONENTS = 5
-UMAP_METRIC = "cosine"
-UMAP_RANDOM_STATE = 42
-
-HDBSCAN_MIN_CLUSTER_SIZE = 2
-HDBSCAN_METRIC = "euclidean"
-
-MMR_LAMBDA = 0.7  # higher -> more relevance, lower -> more diversity
-
-# -------------------------
-# Initialize heavy resources (will download model on first run if necessary)
-# -------------------------
-print("Loading sentence transformer model:", MODEL_NAME)
-model = SentenceTransformer(MODEL_NAME)
-print("Model loaded.")
+    _nltk_available = False
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_MB * 1024 * 1024
 
 # -------------------------
-# Utility functions
+# Configuration / Hyperparams
 # -------------------------
+SENT_EMBED_MODEL_NAME = os.getenv("SBERT_MODEL", "all-mpnet-base-v2")
+# When processing very long documents, we'll only score top_k sentences by PageRank before MMR
+CANDIDATE_SENTENCE_CAP = 300
+SIM_THRESHOLD = 0.1  # threshold to consider edges in graph (avoid fully connected trivial graphs)
+MMR_LAMBDA = 0.7  # balance between relevance and diversity (1.0 -> full relevance)
+DEFAULT_SUMMARY_SENTENCES = 5
 
+# Load model once at start
+print("Loading SBERT model:", SENT_EMBED_MODEL_NAME)
+sbert = SentenceTransformer(SENT_EMBED_MODEL_NAME)
+print("Model loaded.")
 
-def allowed_file(filename: str) -> bool:
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
-
-
-def extract_text_from_pdf(file_stream) -> str:
+# -------------------------
+# Utilities: text extraction and cleaning
+# -------------------------
+def extract_text_from_pdf_stream(stream: io.BytesIO) -> str:
     """
-    Extract text from a file-like object containing a PDF using PyMuPDF.
-    Returns concatenated text from all pages.
+    Use PyMuPDF (fitz) to extract text from a PDF stream.
     """
     try:
-        file_stream.seek(0)
-        doc = fitz.open(stream=file_stream.read(), filetype="pdf")
-        text_parts = []
+        doc = fitz.open(stream=stream, filetype="pdf")
+        texts = []
         for page in doc:
-            text = page.get_text("text")
-            if text:
-                text_parts.append(text)
-        doc.close()
-        return "\n".join(text_parts)
+            texts.append(page.get_text("text"))
+        return "\n".join(texts)
     except Exception as e:
-        print("PDF extraction error:", e)
-        return ""
+        raise RuntimeError(f"Could not extract text from PDF: {e}")
 
+def clean_text(text: str) -> str:
+    # Remove excessive whitespace, repeated page headers like "Page 1", common artifacts
+    text = text.replace("\r\n", "\n")
+    text = re.sub(r"\n{2,}", "\n\n", text)
+    # Remove 'Page X of Y' and 'Page X' footers/headers heuristically
+    text = re.sub(r"Page\s*\d+\s*(of\s*\d+)?", "", text, flags=re.IGNORECASE)
+    # Remove common multiple dashes/separators
+    text = re.sub(r"-{3,}", " ", text)
+    # Trim spaces
+    text = text.strip()
+    return text
 
-def read_text_file(file_stream) -> str:
-    try:
-        file_stream.seek(0)
-        raw = file_stream.read()
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", errors="ignore")
-        return raw
-    except Exception as e:
-        print("Text read error:", e)
-        return ""
-
-
-def split_into_sentences(text: str) -> list:
+def split_into_sentences(text: str) -> List[str]:
     """
-    Splits text into sentences using nltk punkt.
-    Performs simple cleaning and filters out very short sentences.
+    Prefer nltk.sent_tokenize if available; otherwise fallback to a regex-based split.
     """
-    raw_sentences = []
-    for paragraph in text.splitlines():
-        paragraph = paragraph.strip()
-        if not paragraph:
-            continue
-        sents = sent_tokenize(paragraph)
-        raw_sentences.extend([s.strip() for s in sents if s.strip()])
+    text = text.strip()
+    if not text:
+        return []
+    if _nltk_available:
+        try:
+            from nltk.tokenize import sent_tokenize
+            sents = sent_tokenize(text)
+            # Filter out very short lines that are likely headings or artifacts (keep > 3 chars)
+            sents = [s.strip() for s in sents if len(s.strip()) > 3]
+            return sents
+        except Exception:
+            pass
 
-    # Filter tiny sentences that are unlikely to be useful
-    sentences = [s for s in raw_sentences if len(s) >= 20]
-    # If everything is filtered out, fall back to raw_sentences
-    if not sentences:
-        sentences = [s for s in raw_sentences if s]
-    return sentences
+    # Fallback (simple): split on punctuation followed by whitespace and uppercase (heuristic)
+    pattern = re.compile(r'(?<=[\.\?\!])\s+(?=[A-Z0-9\"\'\(\[])')
+    sents = pattern.split(text)
+    sents = [s.strip() for s in sents if len(s.strip()) > 3]
+    return sents
 
+# -------------------------
+# Semantic TextRank (PageRank over SBERT similarity graph)
+# -------------------------
+def build_sentence_embeddings(sentences: List[str]) -> np.ndarray:
+    if len(sentences) == 0:
+        return np.zeros((0, sbert.get_sentence_embedding_dimension()))
+    embeddings = sbert.encode(sentences, convert_to_numpy=True, show_progress_bar=False)
+    return embeddings
 
 def build_similarity_matrix(embeddings: np.ndarray) -> np.ndarray:
+    if embeddings.shape[0] == 0:
+        return np.array([[]])
     sim = cosine_similarity(embeddings)
-    # clip small negatives due to numeric noise
-    sim[sim < 0] = 0.0
+    # clip numerical noise
     np.fill_diagonal(sim, 0.0)
     return sim
 
-
-def compute_pagerank_scores(sim_matrix: np.ndarray) -> np.ndarray:
+def semantic_textrank(sentences: List[str], embeddings: np.ndarray, sim_threshold: float = SIM_THRESHOLD) -> np.ndarray:
     """
-    Build a weighted graph from similarity matrix and compute PageRank.
-    Returns a score per node (sentence).
-    """
-    try:
-        G = nx.from_numpy_array(sim_matrix)
-        # convert 'weight' attribute to numeric if needed
-        pr = nx.pagerank_numpy(G, weight="weight")
-        # pr is dict {node: score}
-        scores = np.array([pr[i] for i in range(len(pr))])
-        return scores
-    except Exception as e:
-        print("PageRank error:", e)
-        # fallback: degree or row sums
-        fallback = sim_matrix.sum(axis=1)
-        if fallback.sum() == 0:
-            fallback = np.ones(sim_matrix.shape[0]) / sim_matrix.shape[0]
-        return fallback
-
-
-def mmr_selection(sentences, embeddings, relevance_scores, top_n=5, lambda_param=0.7):
-    """
-    Maximal Marginal Relevance (MMR)
-    - sentences: list of sentence strings (only used for length)
-    - embeddings: numpy array (n_sentences x dim)
-    - relevance_scores: numpy array of relevance scores (e.g., PageRank)
-    - top_n: desired number of items
-    - lambda_param: trade-off between relevance and diversity
-    Returns list of selected indices in original order of selection (not sorted).
+    Build a graph where nodes are sentences and edge weights are SBERT cosine similarity (if > threshold).
+    Run PageRank to score sentences.
+    Returns PageRank scores aligned to sentences array.
     """
     n = len(sentences)
-    if top_n >= n:
-        return list(range(n))
+    G = nx.Graph()
+    G.add_nodes_from(range(n))
+    sim = build_similarity_matrix(embeddings)
+    # Add edges for pairs above threshold
+    for i in range(n):
+        for j in range(i + 1, n):
+            w = float(sim[i, j])
+            if w > sim_threshold:
+                G.add_edge(i, j, weight=w)
+    # If graph has no edges (all similarities below threshold), add a weak fully connected graph
+    if G.number_of_edges() == 0 and n > 0:
+        for i in range(n):
+            for j in range(i + 1, n):
+                G.add_edge(i, j, weight=float(sim[i, j]) + 1e-6)
 
-    sim = cosine_similarity(embeddings)
+    # PageRank with weights
+    try:
+        pr = nx.pagerank(G, weight='weight')
+        scores = np.array([pr[i] for i in range(n)])
+    except Exception:
+        # fallback: average similarity score
+        scores = sim.sum(axis=1)
+        if scores.sum() > 0:
+            scores = scores / scores.sum()
+    return scores
+
+# -------------------------
+# MMR selection
+# -------------------------
+def mmr_selection(sentences: List[str],
+                  sent_embeddings: np.ndarray,
+                  doc_embedding: np.ndarray,
+                  top_k: int = 5,
+                  lambda_param: float = MMR_LAMBDA,
+                  use_initial_scores: np.ndarray = None) -> List[int]:
+    """
+    Return indices of selected sentences using MMR.
+    If use_initial_scores is provided, it's used as the relevance scores (e.g., PageRank).
+    Otherwise relevance is cosine similarity to doc embedding.
+    """
+    if len(sentences) == 0:
+        return []
+    n = len(sentences)
+    # Compute relevance scores
+    if use_initial_scores is not None:
+        rel = np.array(use_initial_scores, dtype=float)
+        # normalize
+        if rel.max() - rel.min() > 0:
+            rel = (rel - rel.min()) / (rel.max() - rel.min())
+    else:
+        rel = cosine_similarity(sent_embeddings, doc_embedding.reshape(1, -1)).reshape(-1)
+
+    # Candidate set indices
+    candidate_idxs = list(range(n))
     selected = []
-    candidates = set(range(n))
 
-    # Normalize relevance scores
-    rel = relevance_scores.astype(float)
-    if rel.max() > 0:
-        rel = (rel - rel.min()) / (rel.max() - rel.min() + 1e-9)
-
-    # pick the highest relevance as first
+    # Start by picking the highest relevance sentence
     first = int(np.argmax(rel))
     selected.append(first)
-    candidates.remove(first)
+    candidate_idxs.remove(first)
 
-    while len(selected) < top_n and candidates:
-        mmr_scores = {}
-        for c in candidates:
-            # compute max similarity to already selected
-            if selected:
-                max_sim_to_selected = max(sim[c, s] for s in selected)
-            else:
-                max_sim_to_selected = 0.0
-            mmr_score = lambda_param * rel[c] - (1 - lambda_param) * max_sim_to_selected
-            mmr_scores[c] = mmr_score
+    # Precompute cosine similarities between sentences
+    sim_matrix = cosine_similarity(sent_embeddings)
 
-        # pick argmax
-        next_idx = max(mmr_scores.items(), key=lambda x: x[1])[0]
-        selected.append(next_idx)
-        candidates.remove(next_idx)
+    while len(selected) < top_k and candidate_idxs:
+        mmr_scores = []
+        for idx in candidate_idxs:
+            relevance = rel[idx]
+            diversity = max(sim_matrix[idx, sel] for sel in selected) if selected else 0.0
+            mmr_score = lambda_param * relevance - (1.0 - lambda_param) * diversity
+            mmr_scores.append((mmr_score, idx))
+        # pick max mmr score
+        mmr_scores.sort(reverse=True)
+        chosen_idx = mmr_scores[0][1]
+        selected.append(chosen_idx)
+        candidate_idxs.remove(chosen_idx)
 
     return selected
 
-
-def summarize_text(text: str, summary_sentences: int = DEFAULT_SUMMARY_SENTENCES, mmr_lambda=MMR_LAMBDA):
+# -------------------------
+# Top-level summarization pipeline
+# -------------------------
+def summarize_text(text: str, max_sentences: int = DEFAULT_SUMMARY_SENTENCES, ratio: float = None) -> Tuple[str, List[Tuple[int, str]]]:
     """
-    Full pipeline: split -> embed -> reduce -> cluster -> sim matrix -> pagerank -> MMR selection
-    Returns:
-      - summary_sentences_list: ordered list of sentence strings (in original doc order)
-      - meta dict with internal info (cluster labels, scores, etc.)
+    Returns tuple: (summary_text, list_of_selected_sentences_as (index, sentence) in original order)
+    If ratio is provided (0 < ratio <= 1), it overrides max_sentences and determines number of sentences.
     """
+    text = clean_text(text)
     sentences = split_into_sentences(text)
-    if not sentences:
-        return [], {"warning": "No sentences extracted."}
+    n = len(sentences)
+    if n == 0:
+        return "", []
 
-    n_sent = len(sentences)
-    # adjust desired summary length if user specified percentage
-    if isinstance(summary_sentences, float) and 0 < summary_sentences <= 1:
-        k = max(1, math.ceil(n_sent * summary_sentences))
+    # decide number of sentences
+    if ratio is not None:
+        if ratio <= 0 or ratio > 1:
+            raise ValueError("ratio must be in (0, 1].")
+        num_sentences = max(1, math.ceil(n * ratio))
     else:
-        k = int(summary_sentences)
+        num_sentences = min(max_sentences, n)
 
-    if k >= n_sent:
-        # nothing to do
-        return sentences, {"note": "Requested summary length >= sentence count; returning full text."}
+    # If document is very short, return original
+    if n <= num_sentences:
+        return "\n\n".join(sentences), list(enumerate(sentences))
 
-    # embed
-    embeddings = model.encode(sentences, convert_to_numpy=True, show_progress_bar=False)
-    # UMAP reduction for HDBSCAN stability (and speed)
-    try:
-        reducer = umap.UMAP(
-            n_components=UMAP_N_COMPONENTS,
-            metric=UMAP_METRIC,
-            random_state=UMAP_RANDOM_STATE,
-        )
-        emb_reduced = reducer.fit_transform(embeddings)
-    except Exception as e:
-        print("UMAP error, falling back to original embeddings:", e)
-        emb_reduced = embeddings
+    # Build embeddings
+    embeddings = build_sentence_embeddings(sentences)
 
-    # HDBSCAN clustering (optional, we don't strictly require clusters to create summary)
-    try:
-        clusterer = hdbscan.HDBSCAN(min_cluster_size=HDBSCAN_MIN_CLUSTER_SIZE, metric=HDBSCAN_METRIC)
-        cluster_labels = clusterer.fit_predict(emb_reduced)
-    except Exception as e:
-        print("HDBSCAN error, setting all to one cluster:", e)
-        cluster_labels = np.zeros(len(sentences), dtype=int)
+    # Compute PageRank scores (Semantic TextRank)
+    pr_scores = semantic_textrank(sentences, embeddings)
 
-    # similarity matrix (use original embeddings for similarity)
-    sim_matrix = build_similarity_matrix(embeddings)
+    # Limit candidate set for MMR to top_k by PageRank (helps with performance for long docs)
+    top_k_candidates = min(max(num_sentences * 5, 50), CANDIDATE_SENTENCE_CAP, n)
+    cand_idxs_sorted = np.argsort(-pr_scores)[:top_k_candidates]
+    cand_idxs_sorted = list(map(int, cand_idxs_sorted))
 
-    # PageRank scores
-    pr_scores = compute_pagerank_scores(sim_matrix)
+    cand_sentences = [sentences[i] for i in cand_idxs_sorted]
+    cand_embeddings = embeddings[cand_idxs_sorted, :]
 
-    # We now do MMR selection using PageRank as relevance and embeddings for redundancy penalty
-    selected_indices = mmr_selection(sentences, embeddings, pr_scores, top_n=k, lambda_param=mmr_lambda)
+    # Document embedding (centroid)
+    doc_embedding = np.mean(embeddings, axis=0)
 
-    # Order selected sentences in their original order for an extractive readable summary
-    selected_indices_sorted = sorted(selected_indices)
-    summary_sentences_list = [sentences[i] for i in selected_indices_sorted]
+    # Use MMR to pick final indices from candidate set
+    # We'll supply PageRank scores (on candidate set) as initial relevance
+    pr_on_candidates = pr_scores[cand_idxs_sorted]
+    selected_in_cand = mmr_selection(cand_sentences, cand_embeddings, doc_embedding, top_k=num_sentences,
+                                     lambda_param=MMR_LAMBDA, use_initial_scores=pr_on_candidates)
 
-    meta = {
-        "n_sent": n_sent,
-        "embeddings_shape": embeddings.shape,
-        "reduced_shape": emb_reduced.shape,
-        "cluster_labels": cluster_labels.tolist(),
-        "pagerank_scores": pr_scores.tolist(),
-        "selected_indices": selected_indices,
-        "selected_indices_sorted": selected_indices_sorted,
-    }
-    return summary_sentences_list, meta
+    # Map selected indices back to original sentence indices
+    selected_orig_idxs = [cand_idxs_sorted[i] for i in selected_in_cand]
+    selected_orig_idxs_sorted = sorted(selected_orig_idxs)  # keep original document order for readability
 
+    selected_sentences = [(i, sentences[i]) for i in selected_orig_idxs_sorted]
+    summary = "\n\n".join([s for (_, s) in selected_sentences])
+
+    return summary, selected_sentences
 
 # -------------------------
-# Web UI
+# Flask routes and UI
 # -------------------------
 INDEX_HTML = """
 <!doctype html>
 <html lang="en">
   <head>
-    <meta charset="utf-8">
-    <title>Policy Brief Summarizer (Extractive)</title>
-    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta charset="utf-8" />
+    <title>Policy Brief Summarizer — Extractive (SBERT + TextRank + MMR)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
-      body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; background: #f6f8fa; color: #222; padding: 24px; }
-      .container { max-width: 900px; margin: 0 auto; background: white; padding: 24px; border-radius: 10px; box-shadow: 0 8px 30px rgba(10,10,10,0.08); }
-      h1 { margin-top:0; }
-      label { display:block; margin-top: 12px; font-weight:600; }
-      textarea { width:100%; min-height:160px; padding:10px; font-size:14px; border-radius:6px; border:1px solid #ddd; }
-      input[type=file] { margin-top:8px; }
-      .row { display:flex; gap:12px; align-items:center; margin-top:12px; }
-      .small { font-size:0.9rem; color:#666; }
-      button { background:#0366d6; color:white; border:none; padding:10px 16px; border-radius:8px; cursor:pointer; }
-      .result { margin-top:18px; padding:14px; border-radius:8px; background:#fbfdff; border:1px solid #e6eef8; }
-      .meta { font-size:12px; color:#555; margin-top:8px; }
-      .sentence { margin:6px 0; padding:6px; border-left:4px solid #e8eefc; background:#fff; border-radius:4px; }
-      .highlight { background: #fff7cc; padding: 2px 4px; border-radius:3px; }
+      body {font-family: Inter, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial; background:#f6f8fa; color:#111; margin:0; padding:2rem;}
+      .container {max-width:980px; margin:0 auto; background:white; border-radius:12px; padding:1.6rem; box-shadow:0 6px 24px rgba(17, 24, 39, 0.06);}
+      h1 {margin:0 0 0.5rem 0; font-size:1.5rem;}
+      p.lead {margin-top:0; color:#4b5563;}
+      label {display:block; margin-top:1rem; font-weight:600;}
+      textarea {width:100%; min-height:160px; padding:0.6rem; font-size:0.95rem; border-radius:8px; border:1px solid #e5e7eb;}
+      input[type=file] {margin-top:0.5rem;}
+      .row {display:flex; gap:1rem; flex-wrap:wrap; align-items:center;}
+      .small {font-size:0.9rem; color:#6b7280;}
+      .btn {background:#0b74ff; color:white; padding:0.6rem 1rem; border-radius:8px; border:none; cursor:pointer; font-weight:600;}
+      .result {margin-top:1rem; white-space:pre-wrap; background:#f8fafc; padding:1rem; border-radius:8px; border:1px solid #e6eef8;}
+      .meta {margin-top:0.5rem; color:#6b7280;}
+      .footer {margin-top:1rem; font-size:0.85rem; color:#6b7280;}
+      input[type=number] {width:120px; padding:0.45rem; border-radius:8px; border:1px solid #e5e7eb;}
+      input[type=range] {width:200px;}
     </style>
   </head>
   <body>
     <div class="container">
-      <h1>Automatic Extractive Summarizer — Policy Briefs (Primary Healthcare)</h1>
-      <p class="small">Upload a PDF or paste plain text. The pipeline uses SBERT → UMAP → HDBSCAN → PageRank → MMR.</p>
+      <h1>Policy Brief Summarizer — Extractive</h1>
+      <p class="lead">Upload a PDF or paste text. This service uses <strong>SBERT embeddings</strong>, <strong>Semantic TextRank</strong>, and <strong>MMR</strong> to produce concise extractive summaries — tuned for policy / healthcare briefs.</p>
 
-      <form method="POST" action="/summarize" enctype="multipart/form-data">
-        <label>Upload PDF (policy brief) or TXT:</label>
+      <form action="/summarize" method="post" enctype="multipart/form-data">
+        <label>Upload PDF (policy brief) or plain text file (.txt)</label>
         <input type="file" name="file" accept=".pdf,.txt" />
 
-        <label>Or paste plain text:</label>
-        <textarea name="text" placeholder="Paste policy brief or healthcare doc here..."></textarea>
+        <label>Or paste the policy brief text here</label>
+        <textarea name="pasted_text" placeholder="Paste full text of policy brief or healthcare document..."></textarea>
 
-        <div class="row">
-          <label style="margin:0;">Summary length:</label>
-          <input type="number" name="sentences" min="1" value="{{default_sentences}}" style="width:90px;" />
-          <span class="small">Number of sentences. Use a small number for short briefs; default is {{default_sentences}}.</span>
-        </div>
+        <div style="margin-top:0.6rem;" class="row">
+          <div>
+            <label>Summary length (sentences)</label>
+            <input type="number" name="num_sentences" min="1" max="80" value="5" />
+            <div class="small meta">If you prefer ratio, use the next field instead.</div>
+          </div>
 
-        <div style="margin-top:12px;">
-          <label style="margin:0;">MMR lambda (0..1):</label>
-          <input type="number" step="0.05" min="0" max="1" name="mmr_lambda" value="{{default_lambda}}" style="width:90px;" />
-          <span class="small">Higher → more relevance, lower → more diversity.</span>
-        </div>
+          <div>
+            <label>Or summary ratio (0-1)</label>
+            <input type="number" name="ratio" step="0.05" min="0.05" max="1.0" placeholder="e.g., 0.15" />
+            <div class="small meta">Examples: 0.1 → 10% of sentences. If set, this overrides sentences value.</div>
+          </div>
 
-        <div style="margin-top:16px;">
-          <button type="submit">Summarize</button>
+          <div style="align-self:flex-end;">
+            <button class="btn" type="submit">Generate Summary</button>
+          </div>
         </div>
       </form>
 
-      <div style="margin-top:18px; color:#666; font-size:13px;">
-        <strong>Notes:</strong> Short sentences (under ~20 chars) are removed during preprocessing. If result seems short, increase "summary length" or paste more of the document.
+      <div class="footer">
+        <p>Notes: For best results, upload a clean policy brief PDF (no scanned images). Scanned PDFs with no selectable text won't be summarized.</p>
       </div>
     </div>
   </body>
@@ -324,160 +331,100 @@ RESULT_HTML = """
 <!doctype html>
 <html lang="en">
   <head>
-    <meta charset="utf-8">
+    <meta charset="utf-8" />
     <title>Summary Result</title>
-    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
-      body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; background: #f6f8fa; color: #222; padding: 24px; }
-      .container { max-width: 1100px; margin: 0 auto; background: white; padding: 24px; border-radius: 10px; box-shadow: 0 8px 30px rgba(10,10,10,0.08); }
-      h1 { margin-top:0; }
-      .meta { color:#555; font-size:13px; margin-bottom:12px; }
-      .pane { display:flex; gap:18px; align-items:flex-start; }
-      .left { flex:1; }
-      .right { flex:1; }
-      .original { white-space:pre-wrap; padding:12px; border-radius:8px; background:#fcfdff; border:1px solid #eef6ff; max-height:520px; overflow:auto; }
-      .summary { padding:12px; border-radius:8px; background:#fffdf6; border:1px solid #fff0c2; }
-      .sentence { margin:8px 0; padding:8px; border-radius:6px; background:white; border-left:4px solid #e8eefc; }
-      .small { font-size:12px; color:#666; }
-      a.btn { display:inline-block; margin-top:12px; background:#0366d6; color:white; padding:8px 12px; border-radius:6px; text-decoration:none; }
-      ol { padding-left: 18px; }
+      body {font-family: Inter, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial; background:#f6f8fa; color:#111; margin:0; padding:2rem;}
+      .container {max-width:980px; margin:0 auto; background:white; border-radius:12px; padding:1.6rem; box-shadow:0 6px 24px rgba(17, 24, 39, 0.06);}
+      a.btn {background:#0b74ff; color:white; padding:0.6rem 1rem; border-radius:8px; text-decoration:none; font-weight:600;}
+      .meta {color:#6b7280; margin-top:0.25rem;}
+      pre.summary {background:#f8fafc; padding:1rem; border-radius:8px; border:1px solid #e6eef8; white-space:pre-wrap;}
+      ol {padding-left:1.2rem;}
+      li {margin-bottom:0.6rem;}
     </style>
   </head>
   <body>
     <div class="container">
-      <h1>Extractive Summary</h1>
-      <div class="meta">
-        <span class="small">Sentences in doc: {{n_sent}} &nbsp; • &nbsp; Selected: {{selected_count}} &nbsp; • &nbsp; PageRank+MMR used.</span>
-      </div>
+      <a class="btn" href="/">← New summary</a>
+      <h2>Extractive Summary</h2>
+      <div class="meta">Selected {{count}} sentence(s) from document.</div>
+      <pre class="summary">{{summary}}</pre>
 
-      <div class="pane">
-        <div class="left">
-          <h3>Summary (extractive)</h3>
-          <div class="summary">
-            <ol>
-            {% for s in summary %}
-              <li class="sentence">{{s}}</li>
-            {% endfor %}
-            </ol>
-            <a class="btn" href="/download_summary" target="_blank">Download summary (.txt)</a>
-          </div>
-          <div style="margin-top:12px;" class="small">Selected indices (in-document order): {{selected_indices}}</div>
-        </div>
-
-        <div class="right">
-          <h3>Original text (highlights are the selected sentences)</h3>
-          <div class="original">
-            {% for i, s in enumerate(original_sentences) %}
-              {% if i in highlighted %}
-                <div style="background:#fff7cc; padding:6px; border-radius:6px; margin-bottom:6px;"><strong>{{i+1}}.</strong> {{s}}</div>
-              {% else %}
-                <div style="margin-bottom:6px;"><strong>{{i+1}}.</strong> {{s}}</div>
-              {% endif %}
-            {% endfor %}
-          </div>
-        </div>
-      </div>
-
-      <div style="margin-top:18px;">
-        <a href="/" class="btn">Summarize another document</a>
-      </div>
-
+      {% if selected_sentences %}
+      <h3>Selected sentences (in original order)</h3>
+      <ol>
+        {% for idx, sent in selected_sentences %}
+          <li><strong>[{{idx}}]</strong> {{sent}}</li>
+        {% endfor %}
+      </ol>
+      {% endif %}
     </div>
   </body>
 </html>
 """
 
-# temporary storage for download (simple, single-user friendly)
-_last_summary_text = None
-
-
 @app.route("/", methods=["GET"])
 def index():
-    return render_template_string(INDEX_HTML, default_sentences=DEFAULT_SUMMARY_SENTENCES, default_lambda=MMR_LAMBDA)
-
+    return render_template_string(INDEX_HTML)
 
 @app.route("/summarize", methods=["POST"])
-def summarize_route():
-    global _last_summary_text
+def summarize():
+    # Get uploaded file or pasted text
+    uploaded = request.files.get("file")
+    pasted_text = (request.form.get("pasted_text") or "").strip()
+
+    if uploaded and uploaded.filename != "":
+        filename = uploaded.filename.lower()
+        file_bytes = uploaded.read()
+        if filename.endswith(".pdf"):
+            try:
+                text = extract_text_from_pdf_stream(io.BytesIO(file_bytes))
+            except Exception as e:
+                return f"<h3>Error extracting PDF text:</h3><pre>{e}</pre>", 400
+        elif filename.endswith(".txt"):
+            try:
+                text = file_bytes.decode("utf-8", errors="ignore")
+            except Exception as e:
+                text = str(file_bytes)
+        else:
+            return "Unsupported file type. Please upload PDF or TXT.", 400
+    elif pasted_text:
+        text = pasted_text
+    else:
+        return "No input provided. Upload a PDF/TXT or paste text and try again.", 400
+
+    # get parameters
+    ratio_val = request.form.get("ratio", "").strip()
+    num_sentences = request.form.get("num_sentences", "").strip()
+    ratio = None
     try:
-        # get form inputs
-        mmr_lambda = request.form.get("mmr_lambda", type=float)
-        if mmr_lambda is None:
-            mmr_lambda = MMR_LAMBDA
+        if ratio_val:
+            ratio = float(ratio_val)
+    except Exception:
+        ratio = None
+
+    try:
+        if num_sentences:
+            n_sent = int(num_sentences)
         else:
-            mmr_lambda = max(0.0, min(1.0, float(mmr_lambda)))
+            n_sent = DEFAULT_SUMMARY_SENTENCES
+    except Exception:
+        n_sent = DEFAULT_SUMMARY_SENTENCES
 
-        sentences_param = request.form.get("sentences", type=float)
-        if sentences_param is None:
-            sentences_param = DEFAULT_SUMMARY_SENTENCES
-        else:
-            # if user typed a float in (0,1), treat as fraction
-            if 0 < sentences_param <= 1:
-                sentences_param = float(sentences_param)
-            else:
-                sentences_param = int(max(1, round(sentences_param)))
-
-        # fetch text either from uploaded file or pasted text
-        text_input = ""
-        uploaded_file = request.files.get("file")
-        if uploaded_file and uploaded_file.filename:
-            filename = secure_filename(uploaded_file.filename)
-            ext = filename.rsplit(".", 1)[1].lower() if "." in filename else ""
-            if ext == "pdf":
-                text_input = extract_text_from_pdf(uploaded_file.stream)
-            elif ext == "txt":
-                text_input = read_text_file(uploaded_file.stream)
-            else:
-                return "Unsupported file type. Upload PDF or TXT.", 400
-
-        # if user pasted text, prefer that when provided
-        pasted_text = request.form.get("text", "").strip()
-        if pasted_text:
-            text_input = pasted_text
-
-        if not text_input or not text_input.strip():
-            return "No text provided. Upload PDF/TXT or paste text.", 400
-
-        # Run summarization
-        summary_sentences, meta = summarize_text(text_input, summary_sentences=sentences_param, mmr_lambda=mmr_lambda)
-
-        # Save last summary for download
-        _last_summary_text = "\n".join(summary_sentences)
-
-        # Prepare original sentences for highlighting
-        original_sentences = split_into_sentences(text_input)
-        highlighted = meta.get("selected_indices_sorted", [])
-
-        return render_template_string(
-            RESULT_HTML,
-            summary=summary_sentences,
-            original_sentences=original_sentences,
-            highlighted=highlighted,
-            n_sent=meta.get("n_sent", len(original_sentences)),
-            selected_count=len(summary_sentences),
-            selected_indices=meta.get("selected_indices_sorted", []),
-        )
-
+    # Generate summary
+    try:
+        summary_text, selected = summarize_text(text, max_sentences=n_sent, ratio=ratio)
     except Exception as e:
-        traceback.print_exc()
-        return f"Internal server error: {e}", 500
+        return f"<h3>Summarization Failed</h3><pre>{e}</pre>", 500
 
+    return render_template_string(RESULT_HTML, summary=summary_text, selected_sentences=selected, count=len(selected))
 
-@app.route("/download_summary", methods=["GET"])
-def download_summary():
-    global _last_summary_text
-    if not _last_summary_text:
-        return redirect(url_for("index"))
-    # create temp file
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
-    tmp.write(_last_summary_text.encode("utf-8"))
-    tmp.flush()
-    tmp.close()
-    return send_file(tmp.name, as_attachment=True, attachment_filename="summary.txt")
-
+# simple health check
+@app.route("/_health")
+def health():
+    return {"status": "ok", "model": SENT_EMBED_MODEL_NAME}
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    host = "0.0.0.0"
-    print(f"Starting app on {host}:{port}")
-    app.run(host=host, port=port)
+    # Bind to 0.0.0.0 for Render / container hosting
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
