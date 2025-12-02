@@ -6,189 +6,168 @@ from typing import List, Tuple, Dict
 
 import numpy as np
 import networkx as nx
-from flask import Flask, request, render_template_string, abort
+from flask import (
+    Flask,
+    request,
+    render_template_string,
+    abort,
+    make_response,
+)
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from PyPDF2 import PdfReader
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 
 app = Flask(__name__)
 
-# ---------------------- HTML TEMPLATES ---------------------- #
+# ---------------------- HTML TEMPLATES (Tailwind / Med.AI style) ---------------------- #
 
 INDEX_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Policy Brief Summarizer</title>
+  <title>Med.AI | Policy Summarizer (Unsupervised)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>
-    body {
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #0f172a;
-      color: #e5e7eb;
-      margin: 0;
-      padding: 0;
-    }
-    .wrapper {
-      max-width: 960px;
-      margin: 0 auto;
-      padding: 1.5rem;
-    }
-    .card {
-      background: #111827;
-      border-radius: 1rem;
-      padding: 1.5rem 1.75rem;
-      box-shadow: 0 18px 45px rgba(0,0,0,0.6);
-      margin-top: 2rem;
-    }
-    h1 {
-      margin: 0 0 0.4rem 0;
-      font-size: 1.8rem;
-    }
-    .subtitle {
-      font-size: 0.95rem;
-      color: #9ca3af;
-      margin-bottom: 1rem;
-    }
-    .badge {
-      display: inline-block;
-      font-size: 0.7rem;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      padding: 0.25rem 0.6rem;
-      border-radius: 999px;
-      border: 1px solid #2563eb;
-      color: #bfdbfe;
-      margin-bottom: 0.5rem;
-    }
-    .section {
-      margin-top: 1rem;
-      padding-top: 1rem;
-      border-top: 1px solid #1f2937;
-    }
-    label {
-      font-size: 0.9rem;
-    }
-    input[type="file"] {
-      width: 100%;
-      margin: 0.75rem 0 0.25rem;
-    }
-    .row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 1rem;
-    }
-    .col {
-      flex: 1 1 230px;
-    }
-    .radio-group, .check-group {
-      display: flex;
-      flex-direction: column;
-      gap: 0.25rem;
-      font-size: 0.9rem;
-      margin-top: 0.4rem;
-    }
-    .radio-item, .check-item {
-      display: flex;
-      align-items: center;
-      gap: 0.4rem;
-    }
-    .helper {
-      font-size: 0.78rem;
-      color: #9ca3af;
-      margin-top: 0.4rem;
-    }
-    button[type="submit"] {
-      margin-top: 1.4rem;
-      background: linear-gradient(135deg,#2563eb,#1d4ed8);
-      color: #f9fafb;
-      border: none;
-      border-radius: 999px;
-      padding: 0.6rem 1.6rem;
-      font-size: 0.95rem;
-      font-weight: 600;
-      cursor: pointer;
-      box-shadow: 0 12px 30px rgba(37,99,235,0.5);
-    }
-    button[type="submit"]:hover {
-      filter: brightness(1.07);
-    }
-    @media (max-width: 640px) {
-      .card {
-        padding: 1.25rem;
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+          },
+          colors: {
+            teal: {
+              50: '#f0fdfa',
+              100: '#ccfbf1',
+              200: '#99f6e4',
+              300: '#5eead4',
+              400: '#2dd4bf',
+              500: '#14b8a6',
+              600: '#0d9488',
+              700: '#0f766e',
+              800: '#115e59',
+              900: '#134e4a',
+            }
+          }
+        }
       }
     }
-  </style>
+  </script>
+  <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 </head>
-<body>
-  <div class="wrapper">
-    <div class="card">
-      <div class="badge">Unsupervised • TF-IDF • TextRank • MMR</div>
-      <h1>Policy Brief Summarizer</h1>
-      <p class="subtitle">
-        Upload a policy brief (PDF / TXT). The system will generate an abstract and structured bullet summary
-        tailored for primary healthcare policies and similar documents.
-      </p>
-      <form action="{{ url_for('summarize') }}" method="post" enctype="multipart/form-data">
-        <div class="section">
-          <label for="file">Policy Brief (PDF or .txt)</label><br>
-          <input id="file" type="file" name="file" accept=".pdf,.txt" required>
-          <p class="helper">Works best for structured policy documents, guidelines, and official reports.</p>
+<body class="bg-slate-50 text-slate-800 min-h-screen flex items-center justify-center py-10">
+
+  <div class="max-w-3xl w-full px-4">
+    <div class="bg-white/90 shadow-xl shadow-slate-200/80 rounded-2xl border border-slate-200/70 p-8 relative overflow-hidden">
+      <div class="absolute -top-24 -right-24 w-64 h-64 bg-teal-100 rounded-full blur-3xl opacity-70 pointer-events-none"></div>
+      <div class="absolute -bottom-24 -left-24 w-64 h-64 bg-cyan-100 rounded-full blur-3xl opacity-60 pointer-events-none"></div>
+
+      <div class="relative z-10">
+        <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-teal-50 border border-teal-200 text-teal-800 text-xs font-bold uppercase tracking-wide mb-3">
+          <span class="w-2 h-2 rounded-full bg-teal-500 animate-pulse"></span>
+          Unsupervised • TF-IDF • TextRank • MMR
         </div>
-        <div class="section row">
-          <div class="col">
-            <label>Summary Length</label>
-            <div class="radio-group">
-              <label class="radio-item">
-                <input type="radio" name="length" value="short">
-                <span>Short (highly compressed)</span>
-              </label>
-              <label class="radio-item">
-                <input type="radio" name="length" value="medium" checked>
-                <span>Medium (balanced)</span>
-              </label>
-              <label class="radio-item">
-                <input type="radio" name="length" value="long">
-                <span>Long (more detailed)</span>
-              </label>
-            </div>
-          </div>
-          <div class="col">
-            <label>Tone</label>
-            <div class="radio-group">
-              <label class="radio-item">
-                <input type="radio" name="tone" value="academic" checked>
-                <span>Academic</span>
-              </label>
-              <label class="radio-item">
-                <input type="radio" name="tone" value="easy">
-                <span>Easy English</span>
+        <h1 class="text-2xl sm:text-3xl font-extrabold text-slate-900 mb-1">
+          Automatic Policy Brief Summarization
+        </h1>
+        <p class="text-sm text-slate-600 mb-6 max-w-xl">
+          Upload a primary healthcare policy brief (PDF / TXT). The engine will extract an abstract and
+          structured bullet summary optimized for research, viva, and reporting.
+        </p>
+
+        <form action="{{ url_for('summarize') }}" method="post" enctype="multipart/form-data" class="space-y-6">
+          <div>
+            <label for="file" class="block text-sm font-semibold text-slate-800 mb-1">
+              Policy Brief File
+            </label>
+            <div class="flex items-center justify-between gap-3 border border-slate-200 rounded-xl px-4 py-3 bg-slate-50/80 hover:bg-slate-50 transition">
+              <div class="flex items-center gap-3">
+                <div class="w-9 h-9 rounded-xl bg-teal-600 flex items-center justify-center text-white shadow-md shadow-teal-500/40">
+                  <i class="fa-solid fa-file-pdf text-lg"></i>
+                </div>
+                <div>
+                  <p class="text-xs font-medium text-slate-800">Upload PDF or .txt</p>
+                  <p class="text-[11px] text-slate-500">Works best for structured policy / guideline documents.</p>
+                </div>
+              </div>
+              <label class="inline-flex items-center px-4 py-2 rounded-full text-xs font-semibold bg-teal-600 text-white cursor-pointer shadow shadow-teal-500/40 hover:bg-teal-700 transition">
+                <i class="fa-solid fa-upload mr-2 text-xs"></i> Choose file
+                <input id="file" type="file" name="file" accept=".pdf,.txt" class="hidden" required>
               </label>
             </div>
           </div>
-          <div class="col">
-            <label>Extras</label>
-            <div class="check-group">
-              <label class="check-item">
-                <input type="checkbox" name="extra_table" value="1" checked>
-                <span>Key data table</span>
-              </label>
-              <label class="check-item">
-                <input type="checkbox" name="extra_chart" value="1" checked>
-                <span>Category distribution chart</span>
-              </label>
-              <label class="check-item">
-                <input type="checkbox" name="extra_roadmap" value="1" checked>
-                <span>Implementation roadmap</span>
-              </label>
+
+          <div class="grid sm:grid-cols-3 gap-4 pt-1">
+            <div>
+              <p class="text-xs font-semibold text-slate-700 mb-1">Summary Length</p>
+              <div class="space-y-1 text-xs">
+                <label class="flex items-center gap-2 cursor-pointer">
+                  <input type="radio" name="length" value="short" class="text-teal-600" />
+                  <span>Short (very compressed)</span>
+                </label>
+                <label class="flex items-center gap-2 cursor-pointer">
+                  <input type="radio" name="length" value="medium" checked class="text-teal-600" />
+                  <span>Medium (balanced)</span>
+                </label>
+                <label class="flex items-center gap-2 cursor-pointer">
+                  <input type="radio" name="length" value="long" class="text-teal-600" />
+                  <span>Long (more detailed)</span>
+                </label>
+              </div>
+            </div>
+
+            <div>
+              <p class="text-xs font-semibold text-slate-700 mb-1">Tone</p>
+              <div class="space-y-1 text-xs">
+                <label class="flex items-center gap-2 cursor-pointer">
+                  <input type="radio" name="tone" value="academic" checked class="text-teal-600" />
+                  <span>Academic</span>
+                </label>
+                <label class="flex items-center gap-2 cursor-pointer">
+                  <input type="radio" name="tone" value="easy" class="text-teal-600" />
+                  <span>Easy English</span>
+                </label>
+              </div>
+            </div>
+
+            <div>
+              <p class="text-xs font-semibold text-slate-700 mb-1">Summary View</p>
+              <div class="space-y-1 text-xs">
+                <label class="flex items-center gap-2 cursor-pointer">
+                  <input type="radio" name="view" value="standard" checked class="text-teal-600" />
+                  <span>Standard summary</span>
+                </label>
+                <label class="flex items-center gap-2 cursor-pointer">
+                  <input type="radio" name="view" value="actions" class="text-teal-600" />
+                  <span>Key action points</span>
+                </label>
+                <label class="flex items-center gap-2 cursor-pointer">
+                  <input type="radio" name="view" value="research" class="text-teal-600" />
+                  <span>Research view (with analytics)</span>
+                </label>
+              </div>
             </div>
           </div>
-        </div>
-        <button type="submit">Generate Summary</button>
-      </form>
+
+          <div class="flex justify-between items-center pt-2">
+            <p class="text-[11px] text-slate-500 max-w-xs">
+              Unsupervised extractive model (no neural fine-tuning). Safe for viva explanations and methodology diagrams.
+            </p>
+            <button type="submit"
+                    class="inline-flex items-center px-5 py-2.5 rounded-full bg-teal-600 text-white text-sm font-semibold shadow-md shadow-teal-500/40 hover:bg-teal-700 hover:shadow-lg transition">
+              <i class="fa-solid fa-wand-magic-sparkles mr-2 text-xs"></i>
+              Generate Summary
+            </button>
+          </div>
+        </form>
+      </div>
     </div>
   </div>
+
 </body>
 </html>
 """
@@ -200,183 +179,186 @@ RESULT_HTML = """
   <meta charset="UTF-8">
   <title>{{ title }}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>
-    body {
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #0f172a;
-      color: #e5e7eb;
-      margin: 0;
-      padding: 0;
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+          },
+          colors: {
+            teal: {
+              50: '#f0fdfa',
+              100: '#ccfbf1',
+              200: '#99f6e4',
+              300: '#5eead4',
+              400: '#2dd4bf',
+              500: '#14b8a6',
+              600: '#0d9488',
+              700: '#0f766e',
+              800: '#115e59',
+              900: '#134e4a',
+            }
+          }
+        }
+      }
     }
-    .wrapper {
-      max-width: 960px;
-      margin: 0 auto;
-      padding: 1.5rem;
-    }
-    .card {
-      background: #111827;
-      border-radius: 1rem;
-      padding: 1.5rem 1.75rem;
-      box-shadow: 0 18px 40px rgba(0,0,0,0.7);
-      margin-top: 2rem;
-    }
-    h1 {
-      margin: 0 0 0.5rem 0;
-      font-size: 1.7rem;
-    }
-    h2 {
-      margin-top: 1.2rem;
-      margin-bottom: 0.4rem;
-      font-size: 1.2rem;
-    }
-    h3 {
-      margin-top: 0.8rem;
-      margin-bottom: 0.3rem;
-      font-size: 1.05rem;
-    }
-    .subtitle {
-      font-size: 0.9rem;
-      color: #9ca3af;
-      margin-bottom: 0.5rem;
-    }
-    .stats {
-      font-size: 0.85rem;
-      color: #9ca3af;
-      margin-bottom: 0.6rem;
-    }
-    .stats span {
-      margin-right: 1rem;
-    }
-    .section {
-      margin-top: 1rem;
-      padding-top: 1rem;
-      border-top: 1px solid #1f2937;
-    }
-    p {
-      font-size: 0.94rem;
-      line-height: 1.6;
-    }
-    ul {
-      padding-left: 1.2rem;
-      margin-top: 0.2rem;
-      margin-bottom: 0.4rem;
-    }
-    li {
-      font-size: 0.9rem;
-      line-height: 1.6;
-      margin-bottom: 0.25rem;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      margin-top: 0.5rem;
-      font-size: 0.85rem;
-    }
-    th, td {
-      border: 1px solid #1f2937;
-      padding: 0.4rem 0.5rem;
-      text-align: left;
-    }
-    th {
-      background: #1f2937;
-    }
-    .note {
-      font-size: 0.8rem;
-      color: #9ca3af;
-      margin-top: 0.4rem;
-    }
-    .back-link {
-      display: inline-block;
-      margin-top: 1.3rem;
-      font-size: 0.9rem;
-      color: #93c5fd;
-      text-decoration: none;
-    }
-    .back-link:hover {
-      text-decoration: underline;
-    }
-    canvas {
-      max-width: 100%;
-      background: #020617;
-      margin-top: 0.6rem;
-      border-radius: 0.3rem;
-    }
-  </style>
+  </script>
+  <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 </head>
-<body>
-  <div class="wrapper">
-    <div class="card">
-      <h1>{{ title }}</h1>
-      <p class="subtitle">{{ subtitle }}</p>
-      <div class="stats">
-        <span><strong>Summary sentences:</strong> {{ stats.summary_sentences }}</span>
-        <span><strong>Original sentences:</strong> {{ stats.original_sentences }}</span>
-        <span><strong>Compression:</strong> {{ stats.compression_ratio }}%</span>
-      </div>
+<body class="bg-slate-50 text-slate-800 min-h-screen flex items-center justify-center py-10">
 
-      <div class="section">
-        <h2>Abstract</h2>
-        <p>{{ abstract }}</p>
-      </div>
+  <div class="max-w-4xl w-full px-4">
+    <div class="bg-white shadow-xl shadow-slate-200/80 rounded-2xl border border-slate-200/80 p-7 sm:p-8 relative overflow-hidden">
+      <div class="absolute -top-24 -right-24 w-64 h-64 bg-teal-100 rounded-full blur-3xl opacity-60 pointer-events-none"></div>
+      <div class="absolute -bottom-24 -left-24 w-64 h-64 bg-cyan-100 rounded-full blur-3xl opacity-60 pointer-events-none"></div>
 
-      {% if sections %}
-      <div class="section">
-        <h2>Structured Summary</h2>
-        {% for sec in sections %}
-          <h3>{{ sec.title }}</h3>
-          <ul>
-            {% for bullet in sec.bullets %}
-              <li>{{ bullet }}</li>
-            {% endfor %}
-          </ul>
-        {% endfor %}
-      </div>
-      {% endif %}
+      <div class="relative z-10">
+        <div class="flex flex-wrap items-start justify-between gap-3 mb-4">
+          <div>
+            <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-teal-50 border border-teal-200 text-teal-800 text-[11px] font-bold uppercase tracking-wide mb-2">
+              <span class="w-2 h-2 rounded-full bg-teal-500 animate-pulse"></span>
+              Unsupervised Extractive Summary
+            </div>
+            <h1 class="text-xl sm:text-2xl font-extrabold text-slate-900">
+              {{ title }}
+            </h1>
+            <p class="text-xs text-slate-500 mt-1">
+              {{ subtitle }}
+            </p>
+          </div>
+          <div class="text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2">
+            <div><span class="font-semibold text-slate-700">Summary sentences:</span> {{ stats.summary_sentences }}</div>
+            <div><span class="font-semibold text-slate-700">Original sentences:</span> {{ stats.original_sentences }}</div>
+            <div><span class="font-semibold text-slate-700">Compression:</span> {{ stats.compression_ratio }}%</div>
+          </div>
+        </div>
 
-      {% if extras.key_table %}
-      <div class="section">
-        <h2>Key Data Table</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>Category</th>
-              <th>Number of Summary Points</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for cat, count in category_counts.items() %}
-            <tr>
-              <td>{{ cat }}</td>
-              <td>{{ count }}</td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-        <p class="note">Categories are derived automatically from the extracted sentences using simple keyword-based grouping (goals, principles, delivery, prevention, HR, finance, digital, AYUSH, implementation, other).</p>
-      </div>
-      {% endif %}
+        <div class="border-t border-slate-200 pt-4 mt-2 space-y-5 text-sm leading-relaxed">
+          <section>
+            <h2 class="text-sm font-bold text-slate-900 mb-1.5 flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-teal-100 text-teal-700 flex items-center justify-center text-xs">
+                <i class="fa-solid fa-align-left"></i>
+              </span>
+              Abstract
+            </h2>
+            <p class="text-sm text-slate-700">
+              {{ abstract }}
+            </p>
+          </section>
 
-      {% if extras.goals_chart %}
-      <div class="section">
-        <h2>Category Distribution Chart</h2>
-        <canvas id="catChart" height="160"></canvas>
-        <p class="note">This chart shows how the summarized content is distributed across conceptual categories (e.g., key goals, principles, service delivery, financing).</p>
-      </div>
-      {% endif %}
+          {% if sections %}
+          <section>
+            <h2 class="text-sm font-bold text-slate-900 mb-2 flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-slate-100 text-slate-700 flex items-center justify-center text-xs">
+                <i class="fa-solid fa-list-check"></i>
+              </span>
+              Structured Summary
+            </h2>
+            <div class="space-y-3">
+              {% for sec in sections %}
+                <div>
+                  <h3 class="text-xs font-semibold text-slate-900 mb-1 flex items-center gap-1.5">
+                    <span class="w-1.5 h-1.5 rounded-full bg-teal-500"></span>
+                    {{ sec.title }}
+                  </h3>
+                  <ul class="list-disc pl-5 space-y-1">
+                    {% for bullet in sec.bullets %}
+                      <li class="text-[13px] text-slate-700">{{ bullet }}</li>
+                    {% endfor %}
+                  </ul>
+                </div>
+              {% endfor %}
+            </div>
+          </section>
+          {% endif %}
 
-      {% if extras.roadmap and implementation_points %}
-      <div class="section">
-        <h2>Implementation Roadmap (Extractive)</h2>
-        <ul>
-          {% for s in implementation_points %}
-            <li>{{ s }}</li>
-          {% endfor %}
-        </ul>
-        <p class="note">These points are automatically selected sentences related to implementation, strategy, governance or “way forward” from the document.</p>
-      </div>
-      {% endif %}
+          {% if extras.key_table %}
+          <section>
+            <h2 class="text-sm font-bold text-slate-900 mb-2 flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-slate-100 text-slate-700 flex items-center justify-center text-xs">
+                <i class="fa-solid fa-table"></i>
+              </span>
+              Summary Coverage by Category
+            </h2>
+            <div class="overflow-x-auto rounded-xl border border-slate-200 bg-slate-50/60">
+              <table class="min-w-full text-xs">
+                <thead class="bg-slate-100/80 text-slate-700">
+                  <tr>
+                    <th class="px-3 py-2 text-left font-semibold border-b border-slate-200">Category</th>
+                    <th class="px-3 py-2 text-left font-semibold border-b border-slate-200">Number of Points</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for cat, count in category_counts.items() %}
+                  <tr class="odd:bg-white even:bg-slate-50/80">
+                    <td class="px-3 py-2 border-b border-slate-100 capitalize">{{ cat }}</td>
+                    <td class="px-3 py-2 border-b border-slate-100">{{ count }}</td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            <p class="text-[11px] text-slate-500 mt-1">
+              Categories are derived automatically using keyword-based grouping (goals, principles, delivery, prevention, HR, finance, digital, AYUSH, implementation, other).
+            </p>
+          </section>
+          {% endif %}
 
-      <a href="{{ url_for('index') }}" class="back-link">← Summarize another document</a>
+          {% if extras.goals_chart %}
+          <section>
+            <h2 class="text-sm font-bold text-slate-900 mb-2 flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-slate-100 text-slate-700 flex items-center justify-center text-xs">
+                <i class="fa-solid fa-chart-column"></i>
+              </span>
+              Category Distribution
+            </h2>
+            <canvas id="catChart" height="150" class="bg-slate-50 border border-slate-200 rounded-xl"></canvas>
+            <p class="text-[11px] text-slate-500 mt-1">
+              Visual overview of how the summary is distributed across conceptual categories.
+            </p>
+          </section>
+          {% endif %}
+
+          {% if extras.roadmap and implementation_points %}
+          <section>
+            <h2 class="text-sm font-bold text-slate-900 mb-2 flex items-center gap-2">
+              <span class="w-6 h-6 rounded-full bg-slate-100 text-slate-700 flex items-center justify-center text-xs">
+                <i class="fa-solid fa-route"></i>
+              </span>
+              Implementation Roadmap (Extractive)
+            </h2>
+            <ul class="list-disc pl-5 space-y-1">
+              {% for s in implementation_points %}
+                <li class="text-[13px] text-slate-700">{{ s }}</li>
+              {% endfor %}
+            </ul>
+            <p class="text-[11px] text-slate-500 mt-1">
+              Automatically selected sentences related to implementation, strategy, governance, or “way forward”.
+            </p>
+          </section>
+          {% endif %}
+        </div>
+
+        <div class="mt-6 flex flex-wrap items-center justify-between gap-3 pt-4 border-t border-slate-200">
+          <a href="{{ url_for('index') }}"
+             class="inline-flex items-center text-xs font-semibold text-slate-600 hover:text-teal-700">
+            <i class="fa-solid fa-arrow-left mr-2"></i>
+            Summarize another document
+          </a>
+
+          <form method="post" action="{{ url_for('download_pdf') }}">
+            <input type="hidden" name="pdf_text" value="{{ pdf_text|e }}">
+            <button type="submit"
+                    class="inline-flex items-center px-4 py-2 rounded-full bg-teal-600 text-white text-xs font-semibold shadow-md shadow-teal-500/40 hover:bg-teal-700 hover:shadow-lg transition">
+              <i class="fa-solid fa-file-arrow-down mr-2 text-xs"></i>
+              Download Summary (PDF)
+            </button>
+          </form>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -391,7 +373,7 @@ RESULT_HTML = """
       data: {
         labels: labels,
         datasets: [{
-          label: 'Number of summary points',
+          label: 'Summary points',
           data: data,
         }]
       },
@@ -401,8 +383,14 @@ RESULT_HTML = """
           legend: { display: false }
         },
         scales: {
-          x: { ticks: { color: '#e5e7eb' }, grid: { display: false } },
-          y: { ticks: { color: '#e5e7eb' }, grid: { color: '#1f2937' } }
+          x: {
+            ticks: { color: '#0f172a', font: { size: 10 } },
+            grid: { display: false }
+          },
+          y: {
+            ticks: { color: '#64748b', font: { size: 10 } },
+            grid: { color: '#e2e8f0' }
+          }
         }
       }
     });
@@ -423,13 +411,12 @@ def strip_leading_numbering(s: str) -> str:
     return re.sub(r"^\s*\d+(\.\d+)*\s*[:\-\)]?\s*", "", s).strip()
 
 def is_toc_like(s: str) -> bool:
-    """Aggressive TOC filter, but keep possible goal sentences."""
+    """Filter out TOC-like lines but keep legitimate goal sentences."""
     s_lower = s.lower()
     digits = sum(c.isdigit() for c in s)
-    # if lots of digits and long, and no clear goal verbs, treat as TOC-like
     if digits >= 10 and len(s) > 80 and not re.search(
         r"\b(reduce|increase|improve|achieve|eliminate|raise|reach|decrease|enhance)\b",
-        s_lower
+        s_lower,
     ):
         return True
     if re.search(r"\bcontents\b", s_lower):
@@ -465,7 +452,7 @@ def extract_text_from_pdf(file_storage) -> str:
 
 def extract_sections(raw_text: str) -> List[Tuple[str, str]]:
     lines = raw_text.splitlines()
-    sections: List[Tuple[str,str]] = []
+    sections: List[Tuple[str, str]] = []
     current_title = "Front"
     buffer: List[str] = []
 
@@ -506,7 +493,7 @@ def detect_title(raw_text: str) -> str:
 GOAL_METRIC_WORDS = [
     "life expectancy", "mortality", "imr", "u5mr", "mmr",
     "coverage", "immunization", "immunisation", "incidence",
-    "prevalence", "%", " per ", "gdp", "reduction", "rate"
+    "prevalence", "%", " per ", "gdp", "reduction", "rate",
 ]
 
 GOAL_VERBS = [
@@ -518,7 +505,7 @@ GOAL_VERBS = [
     "raise", "raising",
     "reach", "reaching",
     "decrease", "decreasing",
-    "enhance", "enhancing"
+    "enhance", "enhancing",
 ]
 
 def is_goal_sentence(s: str) -> bool:
@@ -598,14 +585,14 @@ def categorize_sentence(s: str) -> str:
 
     return "other"
 
-# ---------------------- TF-IDF + TEXTRANK + MMR ---------------------- #
+# ---------------------- TF-IDF + TextRank + MMR ---------------------- #
 
 def build_tfidf(sentences: List[str]):
     vec = TfidfVectorizer(
         stop_words="english",
         ngram_range=(1, 2),
         max_df=0.9,
-        min_df=1
+        min_df=1,
     )
     mat = vec.fit_transform(sentences)
     return mat
@@ -707,12 +694,11 @@ def summarize_extractive(raw_text: str, length_choice: str = "medium"):
 
     tr_scores = textrank_scores(sim, positional_boost=pos_boost)
 
-    # section scores with boost for goals/principles
+    # section scores with boost for goals/principles sections
     sec_scores = defaultdict(float)
     for i, sec_idx in enumerate(sent_to_section):
         row = tfidf[i]
         sec_scores[sec_idx] += float(np.linalg.norm(row.toarray()))
-
     for sec_idx, (title, _) in enumerate(sections):
         t = title.lower()
         boost = 1.0
@@ -770,10 +756,9 @@ def summarize_extractive(raw_text: str, length_choice: str = "medium"):
         for p in global_picks:
             selected_idxs.append(cand[p])
 
-    # -------- FORCE-INCLUDE TRUE KEY GOAL SENTENCES --------
+    # force-include numeric goal sentences
     goal_indices = [i for i, s in enumerate(sentences) if is_goal_sentence(s)]
     goal_indices_sorted = sorted(goal_indices, key=lambda i: tr_scores.get(i, 0.0), reverse=True)
-
     if goal_indices_sorted:
         max_goal = max(1, min(3, int(0.25 * target)))
         forced_goal = goal_indices_sorted[:max_goal]
@@ -789,7 +774,6 @@ def summarize_extractive(raw_text: str, length_choice: str = "medium"):
         combined = goal_set | set(keep_non_goal)
 
     selected_idxs = sorted(combined)
-
     summary_sentences = [sentences[i].strip() for i in selected_idxs][:target]
     summary_text = " ".join(summary_sentences)
     stats = {
@@ -857,6 +841,53 @@ def build_structured_summary(summary_sentences: List[str], tone: str):
         "implementation_points": implementation_points,
     }
 
+# ---------------------- PDF GENERATION ---------------------- #
+
+def wrap_text_for_pdf(text: str, max_chars: int = 90) -> List[str]:
+    lines: List[str] = []
+    for para in text.split("\n"):
+        para = para.strip()
+        if not para:
+            lines.append("")
+            continue
+        words = para.split()
+        current = words[0]
+        for w in words[1:]:
+            if len(current) + 1 + len(w) <= max_chars:
+                current += " " + w
+            else:
+                lines.append(current)
+                current = w
+        lines.append(current)
+    return lines
+
+def build_pdf_response(pdf_text: str, filename: str = "summary.pdf"):
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+
+    x_margin = 50
+    y = height - 60
+
+    lines = wrap_text_for_pdf(pdf_text, max_chars=95)
+    c.setFont("Helvetica", 11)
+
+    for line in lines:
+        if y < 50:
+            c.showPage()
+            c.setFont("Helvetica", 11)
+            y = height - 60
+        c.drawString(x_margin, y, line)
+        y -= 14
+
+    c.save()
+    buffer.seek(0)
+
+    resp = make_response(buffer.getvalue())
+    resp.headers["Content-Type"] = "application/pdf"
+    resp.headers["Content-Disposition"] = f"attachment; filename={filename}"
+    return resp
+
 # ---------------------- FLASK ROUTES ---------------------- #
 
 @app.route("/", methods=["GET"])
@@ -885,16 +916,43 @@ def summarize():
 
     length_choice = request.form.get("length", "medium").lower()
     tone = request.form.get("tone", "academic").lower()
-
-    extra_table = bool(request.form.get("extra_table"))
-    extra_chart = bool(request.form.get("extra_chart"))
-    extra_roadmap = bool(request.form.get("extra_roadmap"))
+    view = request.form.get("view", "standard").lower()
 
     try:
         summary_sentences, stats = summarize_extractive(raw_text, length_choice=length_choice)
         structured = build_structured_summary(summary_sentences, tone=tone)
     except Exception as e:
         abort(500, f"Error during summarization: {e}")
+
+    # choose which sections to display based on view
+    all_sections = structured["sections"]
+    if view == "actions":
+        allowed_titles = {
+            "Key Goals",
+            "Strengthening Healthcare Delivery",
+            "Financing & Private Sector Engagement",
+            "Implementation & Way Forward",
+        }
+        display_sections = [sec for sec in all_sections if sec["title"] in allowed_titles]
+        extras = {
+            "key_table": True,
+            "goals_chart": False,
+            "roadmap": True,
+        }
+    elif view == "research":
+        display_sections = all_sections
+        extras = {
+            "key_table": True,
+            "goals_chart": True,
+            "roadmap": True,
+        }
+    else:  # standard
+        display_sections = all_sections
+        extras = {
+            "key_table": True,
+            "goals_chart": False,
+            "roadmap": True,
+        }
 
     doc_title_raw = detect_title(raw_text)
     doc_title = doc_title_raw.strip()
@@ -905,12 +963,6 @@ def summarize():
 
     subtitle = "Automatic extractive summary organized as abstract and bullet points (unsupervised: TF-IDF + TextRank + MMR)."
 
-    extras = {
-        "key_table": extra_table,
-        "goals_chart": extra_chart,
-        "roadmap": extra_roadmap,
-    }
-
     category_counts = structured["category_counts"]
     if category_counts:
         labels = list(category_counts.keys())
@@ -918,19 +970,43 @@ def summarize():
     else:
         labels, values = [], []
 
+    # build plain text for PDF export
+    pdf_lines: List[str] = []
+    pdf_lines.append(title)
+    pdf_lines.append("")
+    pdf_lines.append("Abstract")
+    pdf_lines.append(structured["abstract"])
+    pdf_lines.append("")
+    if display_sections:
+        pdf_lines.append("Structured Summary")
+        for sec in display_sections:
+            pdf_lines.append("")
+            pdf_lines.append(sec["title"])
+            for bullet in sec["bullets"]:
+                pdf_lines.append("• " + bullet)
+    pdf_text = "\n".join(pdf_lines)
+
     return render_template_string(
         RESULT_HTML,
         title=title,
         subtitle=subtitle,
         abstract=structured["abstract"],
-        sections=structured["sections"],
+        sections=display_sections,
         stats=stats,
         extras=extras,
         implementation_points=structured["implementation_points"],
         category_counts=category_counts,
         category_labels=labels,
         category_values=values,
+        pdf_text=pdf_text,
     )
+
+@app.route("/download_pdf", methods=["POST"])
+def download_pdf():
+    pdf_text = request.form.get("pdf_text", "").strip()
+    if not pdf_text:
+        abort(400, "No summary available to export.")
+    return build_pdf_response(pdf_text, filename="policy_summary.pdf")
 
 
 if __name__ == "__main__":
