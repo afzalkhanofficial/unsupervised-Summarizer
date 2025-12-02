@@ -432,7 +432,6 @@ def is_toc_like(s: str) -> bool:
 
 def sentence_split(text: str) -> List[str]:
     text = re.sub(r"\n+", " ", text)
-    # pre-split on bullets
     bulleted = re.split(r"\s+[•o]\s+", text)
     sentences = []
     for chunk in bulleted:
@@ -493,7 +492,7 @@ def detect_title(raw_text: str) -> str:
             continue
         if "content" in s.lower():
             break
-        s = re.sub(r"\s+\d+\s*$", "", s)
+        # Do NOT strip year; just return the first meaningful line
         return s
     return "Policy Document"
 
@@ -605,10 +604,20 @@ def summarize_extractive(raw_text: str, length_choice: str = "medium"):
 
     tr_scores = textrank_scores(sim, positional_boost=pos_boost)
 
+    # Section importance with extra boost for goals/principles sections
     sec_scores = defaultdict(float)
     for i, sec_idx in enumerate(sent_to_section):
         row = tfidf[i]
         sec_scores[sec_idx] += float(np.linalg.norm(row.toarray()))
+
+    for sec_idx, (title, _) in enumerate(sections):
+        t = title.lower()
+        boost = 1.0
+        if any(w in t for w in ["goal", "objective"]):
+            boost *= 1.5
+        if "principle" in t:
+            boost *= 1.2
+        sec_scores[sec_idx] *= boost
 
     sorted_secs = sorted(sec_scores.items(), key=lambda x: -x[1])
     num_secs = len(sorted_secs)
@@ -674,63 +683,81 @@ def summarize_extractive(raw_text: str, length_choice: str = "medium"):
 # ---------------------- STRUCTURED SUMMARY BUILDING ---------------------- #
 
 def simplify_for_easy_english(s: str) -> str:
-    s = re.sub(r"\([^)]{1,30}\)", "", s)  # drop short brackets like (NHP), (RMNCH+A)
+    s = re.sub(r"\([^)]{1,30}\)", "", s)
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
-def categorize_sentence(s: str) -> List[str]:
+def categorize_sentence(s: str) -> str:
     s_lower = s.lower()
-    cats: List[str] = []
+    has_digit = any(ch.isdigit() for ch in s_lower)
 
-    if any(w in s_lower for w in ["goal", "objective", "target", "life expectancy", "mortality",
-                                  "reduce ", "increase ", "coverage", "immunization", "immunisation",
-                                  "by 20", "%"]):
-        cats.append("key goals")
+    # key goals: need numbers + goal/target/health outcome words
+    if has_digit and any(w in s_lower for w in [
+        "life expectancy", "mortality", "imr", "u5mr", "mmr",
+        "coverage", "immunization", "immunisation", "incidence",
+        "prevalence", "%", " per ", "by 20", "gdp", "reduction"
+    ]):
+        return "key goals"
 
-    if any(w in s_lower for w in ["principle", "value", "equity", "universal", "right to health",
-                                  "accountability", "integrity", "patient-centred", "patient-centered"]):
-        cats.append("policy principles")
+    if any(w in s_lower for w in [
+        "principle", "values", "equity", "universal access",
+        "universal health", "right to health", "accountability",
+        "integrity", "patient-centred", "patient-centered"
+    ]):
+        return "policy principles"
 
-    if any(w in s_lower for w in ["primary care", "secondary care", "tertiary care",
-                                  "health and wellness centre", "health & wellness centre", "hospital",
-                                  "service delivery", "referral", "emergency services",
-                                  "free drugs", "free diagnostics"]):
-        cats.append("service delivery")
+    if any(w in s_lower for w in [
+        "primary care", "secondary care", "tertiary care",
+        "health and wellness centre", "health & wellness centre",
+        "health & wellness center", "hospital", "service delivery",
+        "referral", "emergency services", "free drugs", "free diagnostics"
+    ]):
+        return "service delivery"
 
-    if any(w in s_lower for w in ["prevention", "preventive", "promotive", "promotion",
-                                  "sanitation", "nutrition", "tobacco", "alcohol",
-                                  "air pollution", "road safety", "lifestyle", "behaviour change",
-                                  "behavior change"]):
-        cats.append("prevention & promotion")
+    if any(w in s_lower for w in [
+        "prevention", "preventive", "promotive", "promotion",
+        "sanitation", "nutrition", "tobacco", "alcohol",
+        "air pollution", "road safety", "lifestyle", "behaviour change",
+        "behavior change", "swachh", "clean water"
+    ]):
+        return "prevention & promotion"
 
-    if any(w in s_lower for w in ["human resources for health", "hrh",
-                                  "health workforce", "doctors", "nurses",
-                                  "mid-level", "medical college", "nursing college",
-                                  "public health management cadre"]):
-        cats.append("human resources")
+    if any(w in s_lower for w in [
+        "human resources for health", "hrh", "health workforce",
+        "doctors", "nurses", "mid-level", "medical college",
+        "nursing college", "public health management cadre",
+        "training", "capacity building"
+    ]):
+        return "human resources"
 
-    if any(w in s_lower for w in ["financing", "financial protection", "insurance",
-                                  "strategic purchasing", "public spending", "gdp",
-                                  "expenditure", "catastrophic", "private sector", "ppp"]):
-        cats.append("financing & private sector")
+    if any(w in s_lower for w in [
+        "financing", "financial protection", "insurance",
+        "strategic purchasing", "public spending", "gdp",
+        "expenditure", "catastrophic", "private sector", "ppp",
+        "reimbursement", "fees", "empanelment"
+    ]):
+        return "financing & private sector"
 
-    if any(w in s_lower for w in ["digital health", "health information", "ehr",
-                                  "electronic health record", "telemedicine",
-                                  "information system", "surveillance", "ndha"]):
-        cats.append("digital health")
+    if any(w in s_lower for w in [
+        "digital health", "health information", "ehr",
+        "electronic health record", "telemedicine",
+        "information system", "surveillance", "ndha", "health data"
+    ]):
+        return "digital health"
 
-    if any(w in s_lower for w in ["ayush", "ayurveda", "yoga", "unani", "siddha", "homeopathy"]):
-        cats.append("ayush integration")
+    if any(w in s_lower for w in [
+        "ayush", "ayurveda", "yoga", "unani", "siddha", "homeopathy"
+    ]):
+        return "ayush integration"
 
-    if any(w in s_lower for w in ["implementation", "way forward", "roadmap",
-                                  "action plan", "strategy", "governance",
-                                  "monitoring", "evaluation", "framework"]):
-        cats.append("implementation")
+    if any(w in s_lower for w in [
+        "implementation", "way forward", "roadmap",
+        "action plan", "strategy", "governance",
+        "monitoring", "evaluation", "framework"
+    ]):
+        return "implementation"
 
-    if not cats:
-        cats.append("other")
-
-    return cats
+    return "other"
 
 def build_structured_summary(summary_sentences: List[str], tone: str):
     if tone == "easy":
@@ -743,8 +770,8 @@ def build_structured_summary(summary_sentences: List[str], tone: str):
 
     category_to_sentences: Dict[str, List[str]] = defaultdict(list)
     for s in processed:
-        for c in categorize_sentence(s):
-            category_to_sentences[c].append(s)
+        cat = categorize_sentence(s)
+        category_to_sentences[cat].append(s)
 
     section_order = [
         ("key goals", "Key Goals"),
@@ -763,7 +790,6 @@ def build_structured_summary(summary_sentences: List[str], tone: str):
     for key, title in section_order:
         bullets = category_to_sentences.get(key, [])
         if bullets:
-            # de-duplicate within category
             seen = set()
             unique_bullets = []
             for b in bullets:
