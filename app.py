@@ -423,10 +423,16 @@ def strip_leading_numbering(s: str) -> str:
     return re.sub(r"^\s*\d+(\.\d+)*\s*[:\-\)]?\s*", "", s).strip()
 
 def is_toc_like(s: str) -> bool:
+    """Aggressive TOC filter, but keep possible goal sentences."""
+    s_lower = s.lower()
     digits = sum(c.isdigit() for c in s)
-    if digits > 6 and len(s) > 80:
+    # if lots of digits and long, and no clear goal verbs, treat as TOC-like
+    if digits >= 10 and len(s) > 80 and not re.search(
+        r"\b(reduce|increase|improve|achieve|eliminate|raise|reach|decrease|enhance)\b",
+        s_lower
+    ):
         return True
-    if re.search(r"\bcontents\b", s.lower()):
+    if re.search(r"\bcontents\b", s_lower):
         return True
     return False
 
@@ -495,18 +501,41 @@ def detect_title(raw_text: str) -> str:
         return s
     return "Policy Document"
 
-# ---------------------- CATEGORIZATION ---------------------- #
+# ---------------------- GOAL & CATEGORY HELPERS ---------------------- #
+
+GOAL_METRIC_WORDS = [
+    "life expectancy", "mortality", "imr", "u5mr", "mmr",
+    "coverage", "immunization", "immunisation", "incidence",
+    "prevalence", "%", " per ", "gdp", "reduction", "rate"
+]
+
+GOAL_VERBS = [
+    "reduce", "reducing", "reduction",
+    "increase", "increasing",
+    "improve", "improving",
+    "achieve", "achieving",
+    "eliminate", "eliminating",
+    "raise", "raising",
+    "reach", "reaching",
+    "decrease", "decreasing",
+    "enhance", "enhancing"
+]
+
+def is_goal_sentence(s: str) -> bool:
+    s_lower = s.lower()
+    has_digit = any(ch.isdigit() for ch in s_lower)
+    if not has_digit:
+        return False
+    if not any(w in s_lower for w in GOAL_METRIC_WORDS):
+        return False
+    if not any(v in s_lower for v in GOAL_VERBS):
+        return False
+    return True
 
 def categorize_sentence(s: str) -> str:
     s_lower = s.lower()
-    has_digit = any(ch.isdigit() for ch in s_lower)
 
-    # key goals: need numbers + goal/target/health outcome words
-    if has_digit and any(w in s_lower for w in [
-        "life expectancy", "mortality", "imr", "u5mr", "mmr",
-        "coverage", "immunization", "immunisation", "incidence",
-        "prevalence", "%", " per ", "by 20", "gdp", "reduction"
-    ]):
+    if is_goal_sentence(s):
         return "key goals"
 
     if any(w in s_lower for w in [
@@ -678,7 +707,7 @@ def summarize_extractive(raw_text: str, length_choice: str = "medium"):
 
     tr_scores = textrank_scores(sim, positional_boost=pos_boost)
 
-    # -------- section scoring with boost for goals/principles sections --------
+    # section scores with boost for goals/principles
     sec_scores = defaultdict(float)
     for i, sec_idx in enumerate(sent_to_section):
         row = tfidf[i]
@@ -741,20 +770,18 @@ def summarize_extractive(raw_text: str, length_choice: str = "medium"):
         for p in global_picks:
             selected_idxs.append(cand[p])
 
-    # -------- FORCE-INCLUDE KEY GOAL SENTENCES --------
-    goal_indices = [i for i, s in enumerate(sentences) if categorize_sentence(s) == "key goals"]
-    goal_indices_sorted = sorted(goal_indices, key=lambda i: -tr_scores.get(i, 0.0))
+    # -------- FORCE-INCLUDE TRUE KEY GOAL SENTENCES --------
+    goal_indices = [i for i, s in enumerate(sentences) if is_goal_sentence(s)]
+    goal_indices_sorted = sorted(goal_indices, key=lambda i: tr_scores.get(i, 0.0), reverse=True)
+
     if goal_indices_sorted:
-        # choose up to 3 goal sentences, or 25% of target, whichever smaller but at least 1
-        desired_goal = min(len(goal_indices_sorted),
-                           max(1, min(3, int(0.25 * target))))
-        forced_goal = goal_indices_sorted[:desired_goal]
+        max_goal = max(1, min(3, int(0.25 * target)))
+        forced_goal = goal_indices_sorted[:max_goal]
     else:
         forced_goal = []
 
     combined = set(selected_idxs) | set(forced_goal)
     if len(combined) > target:
-        # keep all goal sentences; drop lowest-scoring non-goal sentences
         goal_set = set(forced_goal)
         non_goal = [i for i in combined if i not in goal_set]
         non_goal_sorted = sorted(non_goal, key=lambda i: tr_scores.get(i, 0.0), reverse=True)
@@ -763,7 +790,6 @@ def summarize_extractive(raw_text: str, length_choice: str = "medium"):
 
     selected_idxs = sorted(combined)
 
-    # ------------------------------------------------------------------ #
     summary_sentences = [sentences[i].strip() for i in selected_idxs][:target]
     summary_text = " ".join(summary_sentences)
     stats = {
