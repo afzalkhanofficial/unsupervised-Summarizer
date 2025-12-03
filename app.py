@@ -46,11 +46,11 @@ else:
 def get_gemini_model():
     """
     Helper to create a Gemini model instance.
-    Uses gemini-1.5-flash for speed + image support.
+    Uses gemini-3-pro-preview for speed + image support.
     """
     if not GEMINI_API_KEY:
         raise RuntimeError("Gemini API key not configured. Set GEMINI_API_KEY environment variable.")
-    return genai.GenerativeModel("gemini-1.5-flash")
+    return genai.GenerativeModel("gemini-3-pro-preview")
 
 
 def extract_text_with_gemini_from_image(image_bytes: bytes) -> str:
