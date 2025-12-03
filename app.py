@@ -99,21 +99,7 @@ INDEX_HTML = """
 </head>
 <body class="bg-slate-50 text-slate-800 relative overflow-x-hidden">
 
-  <!-- Loader used by script.js if present -->
-  <div id="loader" class="fixed inset-0 z-[100] bg-white flex flex-col items-center justify-center transition-opacity duration-700">
-    <div class="relative flex items-center justify-center mb-4">
-      <div class="w-20 h-20 border-4 border-teal-100 border-t-teal-600 rounded-full animate-spin"></div>
-      <div class="absolute inset-0 flex items-center justify-center">
-        <i class="fa-solid fa-staff-snake text-teal-600 text-2xl animate-pulse"></i>
-      </div>
-    </div>
-    <div class="text-xl font-extrabold tracking-tight text-slate-900">
-      Med<span class="text-teal-600">.AI</span>
-    </div>
-    <p class="text-xs text-slate-500 mt-2 font-medium">Initializing Models...</p>
-  </div>
-
-  <!-- Background blobs -->
+  <!-- Background blobs (keep your nice aesthetic) -->
   <div class="blob blob-1 animate-float-slow"></div>
   <div class="blob blob-2 animate-float-medium"></div>
 
