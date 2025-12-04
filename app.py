@@ -1254,7 +1254,7 @@ def gemini_answer(user_message: str, doc_text: str) -> str:
         return "Gemini API key is not configured on the server."
 
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-3-pro-preview")
         prompt = (
             "You are an AI assistant helping a student understand a healthcare policy document.\n"
             "Answer concisely and only using information from the document.\n\n"
